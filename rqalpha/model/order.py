@@ -14,6 +14,7 @@
 
 import time
 from decimal import Decimal
+from threading import Lock
 
 import numpy as np
 
@@ -46,6 +47,9 @@ class Order(object):
         self._type = None
         self._avg_price = None
         self._transaction_cost = None
+        self._kwargs = None
+
+        self._lock = Lock()
 
     @staticmethod
     def _enum_to_str(v):
@@ -72,6 +76,7 @@ class Order(object):
             'type': self._enum_to_str(self._type),
             'transaction_cost': self._transaction_cost,
             'avg_price': self._avg_price,
+            'kwargs': self._kwargs,
         }
 
     def set_state(self, d):
@@ -94,9 +99,10 @@ class Order(object):
         self._type = self._str_to_enum(ORDER_TYPE, d['type'])
         self._transaction_cost = d['transaction_cost']
         self._avg_price = d['avg_price']
+        self._kwargs = d['kwargs']
 
     @classmethod
-    def __from_create__(cls, order_book_id, quantity, side, style, position_effect):
+    def __from_create__(cls, order_book_id, quantity, side, style, position_effect, **kwargs):
         env = Environment.get_instance()
         order = cls()
         order._order_id = next(order.order_id_gen)
@@ -120,6 +126,7 @@ class Order(object):
             order._type = ORDER_TYPE.MARKET
         order._avg_price = 0
         order._transaction_cost = 0
+        order._kwargs = kwargs
         return order
 
     @property
@@ -252,6 +259,10 @@ class Order(object):
             raise RuntimeError("Frozen price of order {} is not supposed to be nan.".format(self.order_id))
         return self._frozen_price
 
+    @property
+    def kwargs(self):
+        return self._kwargs
+
     def is_final(self):
         return self._status not in {
             ORDER_STATUS.PENDING_NEW,
@@ -266,31 +277,41 @@ class Order(object):
         self._status = ORDER_STATUS.ACTIVE
 
     def set_pending_cancel(self):
-        if not self.is_final():
-            self._status = ORDER_STATUS.PENDING_CANCEL
+        with self._lock:
+            if not self.is_final():
+                self._status = ORDER_STATUS.PENDING_CANCEL
 
     def fill(self, trade):
-        quantity = trade.last_quantity
-        assert self.filled_quantity + quantity <= self.quantity
-        new_quantity = self._filled_quantity + quantity
-        self._avg_price = (self._avg_price * self._filled_quantity + trade.last_price * quantity) / new_quantity
-        self._transaction_cost += trade.commission + trade.tax
-        self._filled_quantity = new_quantity
-        if self.unfilled_quantity == 0:
-            self._status = ORDER_STATUS.FILLED
+        with self._lock:
+            quantity = trade.last_quantity
+            assert self.filled_quantity + quantity <= self.quantity
+            new_quantity = self._filled_quantity + quantity
+            self._avg_price = (self._avg_price * self._filled_quantity + trade.last_price * quantity) / new_quantity
+            self._transaction_cost += trade.commission + trade.tax
+            self._filled_quantity = new_quantity
+            if self.unfilled_quantity == 0:
+                self._status = ORDER_STATUS.FILLED
 
     def mark_rejected(self, reject_reason):
-        if not self.is_final():
-            self._message = reject_reason
-            self._status = ORDER_STATUS.REJECTED
-            user_system_log.warn(reject_reason)
+        with self._lock:
+            if not self.is_final():
+                self._message = reject_reason
+                self._status = ORDER_STATUS.REJECTED
+                user_system_log.warn(reject_reason)
 
     def mark_cancelled(self, cancelled_reason, user_warn=True):
-        if not self.is_final():
-            self._message = cancelled_reason
-            self._status = ORDER_STATUS.CANCELLED
-            if user_warn:
-                user_system_log.warn(cancelled_reason)
+        with self._lock:
+            if not self.is_final():
+                self._message = cancelled_reason
+                self._status = ORDER_STATUS.CANCELLED
+                if user_warn:
+                    user_system_log.warn(cancelled_reason)
+
+    def mark_cancel_failed(self, cancel_failed_reason):
+        with self._lock:
+            if self.status == ORDER_STATUS.PENDING_CANCEL:
+                self._status = ORDER_STATUS.ACTIVE
+                user_system_log.warning(cancel_failed_reason)
 
     def set_frozen_price(self, value):
         self._frozen_price = value
